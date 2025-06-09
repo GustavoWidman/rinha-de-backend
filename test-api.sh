@@ -55,5 +55,14 @@ else
     echo "❌ Dados inválidos retornaram código $HTTP_CODE (esperado 422)"
 fi
 
+# Teste 7: Endpoint de Reset
+echo "7️⃣ Testando endpoint de reset..."
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/reset")
+if [ "$HTTP_CODE" = "200" ]; then
+	echo "✅ Endpoint de reset retornou 200 corretamente"
+else
+	echo "❌ Endpoint de reset retornou código $HTTP_CODE (esperado 200)"
+fi
+
 echo "==============================================="
 echo "🎯 Testes básicos concluídos!"

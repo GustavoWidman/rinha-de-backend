@@ -97,6 +97,16 @@ else
     exit 1
 fi
 
+# Reset DB
+print_info "Resetting database..."
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_BASE_URL/reset")
+if [ "$HTTP_CODE" = "200" ]; then
+	print_status "Database reset: OK"
+else
+	print_error "Database reset: HTTP $HTTP_CODE"
+	exit 1
+fi
+
 echo ""
 echo "🎉 API is ready for load testing!"
 echo "   Run: ./executar-teste-local.sh"

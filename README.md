@@ -28,23 +28,23 @@ API RESTful de alta performance desenvolvida em Rust com foco em escalabilidade 
 
 #### 1. Load Balancer (Nginx)
 
-- **CPU**: 0.17 cores
-- **Memória**: 50MB
-- **Algoritmo**: Round Robin
-- **Health Checks**: Monitoramento ativo das instâncias
+- **CPU**: 0.5 cores
+- **Memória**: 100MB
+- **Otimizações**: Configurações específicas para alta performance
+- **Conexões**: Suporta até 4096 conexões simultâneas (worker_connections)
 - **Porta**: 9999 (conforme especificação)
 
 #### 2. API Instances (2x Rust + Actix-Web)
 
-- **CPU**: 0.6 cores cada
-- **Memória**: 200MB cada
+- **CPU**: 0.3 cores cada (total 0.6 cores)
+- **Memória**: 100MB cada (total 200MB)
 - **Workers**: 4 por instância (otimizado para concorrência)
-- **Pool de Conexões**: 32 conexões por instância
+- **Pool de Conexões**: 20 conexões por instância
 
-#### 3. Banco de Dados (PostgreSQL 16)
+#### 3. Banco de Dados (PostgreSQL 17)
 
-- **CPU**: 0.13 cores
-- **Memória**: 100MB
+- **CPU**: 0.4 cores
+- **Memória**: 250MB
 - **Otimizações**: Configurações específicas para alta performance
 - **Índices**: Otimizados para consultas frequentes
 
@@ -82,8 +82,6 @@ O PostgreSQL garante ACID, enquanto a validação em camadas (aplicação + banc
 **O que foi implementado:**
 
 - 2 instâncias da API para redundância
-- Health checks no load balancer
-- Failover automático via
 - Pool de conexões configurado para evitar esgotamento
 - Configuração otimizada do PostgreSQL
 
@@ -107,15 +105,15 @@ A arquitetura permite adicionar mais instâncias facilmente. O design stateless 
 
 **O que foi implementado:**
 
-- Rust (zero-cost abstractions + memory safety)
-- Actix-Web (um dos frameworks web mais rápidos)
+- Rust (zero-cost abstractions + memory safety + fearless concurrency)
+- Actix-Web (um dos frameworks web mais rápidos do mundo)
 - PostgreSQL com tuning específico
 - Índices otimizados para queries frequentes
 - Pool de conexões dimensionado
 - Multi-stage Docker build
 
 **Justificativa:**
-Rust oferece performance próxima ao C sem sacrificar segurança. PostgreSQL tunado e índices estratégicos minimizam latência. O pool de conexões evita overhead de criação/destruição.
+Rust oferece performance próxima ao C sem sacrificar segurança e confortabilidade durante desenvolvimento. PostgreSQL tunado e índices estratégicos minimizam latência. O pool de conexões evita overhead de criação/destruição.
 
 ### **Manutenibilidade do Sistema**
 
@@ -179,6 +177,12 @@ Content-Type: application/json
 GET /clientes/{id}/extrato
 ```
 
+#### Reiniciar Estado do Banco de Dados
+
+```bash
+POST /reset
+```
+
 ## 📊 Otimizações de Performance
 
 ### PostgreSQL
@@ -191,7 +195,7 @@ GET /clientes/{id}/extrato
 
 ### Aplicação Rust
 
-- Pool de 32 conexões por instância
+- Pool de 20 conexões por instância
 - 4 workers por instância do Actix
 - Queries otimizadas com índices específicos
 - Validação eficiente de dados
@@ -208,9 +212,9 @@ GET /clientes/{id}/extrato
 
 1. **PostgreSQL vs NoSQL**: Escolhi PostgreSQL pela robustez ACID necessária para transações financeiras, mesmo com possível trade-off de performance em writes extremos.
 
-2. **Pool de Conexões**: 32 conexões por instância balanceia utilização de recursos vs throughput. Muito alto poderia saturar o banco.
+2. **Pool de Conexões**: 20 conexões por instância balanceia utilização de recursos vs throughput. Muito alto poderia saturar o banco.
 
-3. **Memória Limitada**: Com apenas 550MB total, priorizei a aplicação (400MB) sobre cache de banco, assumindo que o workload é mais CPU-intensive.
+3. **Memória Limitada**: Com apenas 550MB total, priorizei o banco de dados e load balancer ao invés da API, já que sabia que conseguia fazer uma API eficiente que não exigiria tanta memória.
 
 4. **Rust sobre Go/Node**: Rust oferece melhor performance e safety, mas com complexidade de desenvolvimento maior.
 
@@ -226,17 +230,23 @@ GET /clientes/{id}/extrato
 ## 📝 Especificações Atendidas
 
 ✅ Load balancer na porta 9999
+
 ✅ 2 instâncias da API
+
 ✅ Banco de dados persistente
+
 ✅ Limites de CPU (1.5 total) e Memória (550MB total)
+
 ✅ Clientes pré-cadastrados (IDs 1-5)
+
 ✅ Endpoints especificados com validações
+
 ✅ Códigos HTTP corretos (200, 404, 422)
 
 **Total de recursos utilizados:**
 
-- CPU: 1.5 cores (0.6 + 0.6 + 0.17 + 0.13)
-- Memória: 450MB (200 + 200 + 50 + 100) - margem para overhead do Docker
+- CPU: 1.5 cores (0.3 + 0.3 + 0.5 + 0.4)
+- Memória: 550MB (100 + 100 + 100 + 250) - margem para overhead do Docker
 
 ## 🚀 Load Testing com Gatling
 
@@ -374,9 +384,9 @@ O script irá:
 #### Métricas Importantes
 
 1. **Response Time Percentiles**
-   - P50 (mediana): < 50ms recomendado
-   - P95: < 200ms recomendado
-   - P99: < 500ms recomendado
+   - P50 (mediana): < 2ms recomendado
+   - P95: < 5ms recomendado
+   - P99: < 10ms recomendado
 
 2. **Request Rate**
    - Débitos: Deve sustentar 220 RPS
@@ -384,7 +394,7 @@ O script irá:
    - Extratos: Deve sustentar 10 RPS
 
 3. **Error Rate**
-   - < 1% de erros inesperados
+   - 0% de erros inesperados
    - 404/422 devem ser tratados corretamente
 
 #### Relatório HTML
@@ -434,7 +444,8 @@ export GATLING_HOME=/caminho/para/gatling
 docker-compose ps
 
 # Reiniciar se necessário
-./run.sh
+docker-compose down
+docker-compose up --build --force-recreate
 ```
 
 #### Performance baixa
@@ -455,13 +466,23 @@ Principais parâmetros configuráveis:
 - `during()`: Duração de cada fase
 - `randomClienteId()`: Range de IDs de clientes testados
 
+### 🔥 Resultados Pessoais
+
+Com o meu MacBook Pro M3 Max, consegui atingir os seguintes resultados:
+
+- **Débitos**: 220 RPS sustentados por 2 minutos com 100% de sucesso, P50 de 2ms, P95 de 4ms, P99 de 8ms.
+- **Créditos**: 110 RPS sustentados por 2 minutos com 100% de sucesso, P50 de 2ms, P95 de 4ms, P99 de 9ms.
+- **Extratos**: 10 RPS sustentados por 2 minutos com 100% de sucesso, P50 de 2ms, P95 de 4ms, P99 de 7ms.
+- **Total**: Média de 340 RPS com 100% de sucesso, sem erros inesperados, com todos os percentis dentro dos limites esperados.
+
+Vale notar que em nenhum ponto durante os testes, as instancias da API passaram de 4MiB de memória, o que demonstra a eficiência do Rust e Actix-Web em termos de consumo de recursos.
+
 ---
 
 ## 📁 Arquivos e Scripts
 
 ### Scripts de Execução
 
-- `run.sh` - Inicia o ambiente Docker completo
 - `test-api.sh` - Testa endpoints da API manualmente
 - `executar-teste-local.sh` - Executa testes de carga Gatling
 - `check-api-health.sh` - Verifica saúde da API antes dos testes
@@ -475,7 +496,7 @@ Principais parâmetros configuráveis:
 
 - `docker-compose.yml` - Orquestração dos containers
 - `Dockerfile` - Build da aplicação Rust
-- `file` - Configuração do load balancer
+- `nginx.conf` - Configuração do load balancer (Nginx)
 - `script.sql` - Inicialização do banco de dados
 
 ### Load Testing
@@ -493,7 +514,7 @@ load-test/
 
 ```bash
 # Iniciar ambiente
-./run.sh
+docker-compose up --build --force-recreate
 
 # Verificar API
 ./check-api-health.sh
