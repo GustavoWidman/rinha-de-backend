@@ -1,10 +1,9 @@
 use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer, Result as ActixResult};
 use chrono::{DateTime, Utc};
-use deadpool_postgres::{Config, Pool, Runtime};
 use log::error;
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Row, Sqlite};
 use std::env;
-use tokio_postgres::NoTls;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TransacaoRequest {
@@ -43,118 +42,85 @@ struct ExtratoResponse {
 async fn criar_transacao(
     path: web::Path<i32>,
     payload: web::Json<TransacaoRequest>,
-    pool: web::Data<Pool>,
+    pool: web::Data<Pool<Sqlite>>,
 ) -> ActixResult<HttpResponse> {
     let cliente_id = path.into_inner();
     let transacao = payload.into_inner();
 
-    // Validações básicas primeiro
-    if transacao.tipo != "c" && transacao.tipo != "d" {
-        return Ok(HttpResponse::UnprocessableEntity().json("Tipo inválido"));
-    }
-
-    if transacao.descricao.is_empty() || transacao.descricao.len() > 10 {
-        return Ok(HttpResponse::UnprocessableEntity().json("Descrição inválida"));
-    }
-
     if transacao.valor <= 0 {
-        return Ok(HttpResponse::UnprocessableEntity().json("Valor inválido"));
+        return Ok(HttpResponse::UnprocessableEntity().finish());
     }
-
-    // Validar se cliente_id está na faixa válida (1-5)
+    if transacao.descricao.is_empty() || transacao.descricao.len() > 10 {
+        return Ok(HttpResponse::UnprocessableEntity().finish());
+    }
     if cliente_id < 1 || cliente_id > 5 {
-        return Ok(HttpResponse::NotFound().json("Cliente não encontrado"));
+        return Ok(HttpResponse::NotFound().finish());
     }
 
-    let mut client = match pool.get().await {
-        Ok(client) => client,
-        Err(e) => {
-            error!(
-                "Erro ao obter conexão do pool para cliente {}: {:?}",
-                cliente_id, e
-            );
-            return Ok(HttpResponse::InternalServerError().json("Erro de conexão"));
-        }
-    };
-
-    // Usar transação atômica para evitar race conditions
-    let tx = match client.transaction().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            error!(
-                "Erro ao iniciar transação para cliente {}: {:?}",
-                cliente_id, e
-            );
-            return Ok(HttpResponse::InternalServerError().json("Erro na transação"));
-        }
-    };
-
-    // Usar SELECT FOR UPDATE para bloquear a linha durante a atualização
-    let row = match tx
-        .query_one(
-            "SELECT id, limite, saldo FROM clientes WHERE id = $1 FOR UPDATE",
-            &[&cliente_id],
-        )
-        .await
-    {
-        Ok(row) => row,
-        Err(e) => {
-            error!(
-                "Erro ao buscar cliente {} com SELECT FOR UPDATE: {:?}",
-                cliente_id, e
-            );
-            return Ok(HttpResponse::NotFound().json("Cliente não encontrado"));
-        }
-    };
-
-    let limite: i32 = row.get("limite");
-    let saldo_atual: i32 = row.get("saldo");
-
-    // Calcular novo saldo
-    let novo_saldo = if transacao.tipo == "c" {
-        saldo_atual + transacao.valor
+    let valor_a_aplicar = if transacao.tipo == "c" {
+        transacao.valor
+    } else if transacao.tipo == "d" {
+        -transacao.valor
     } else {
-        saldo_atual - transacao.valor
+        return Ok(HttpResponse::UnprocessableEntity().finish());
     };
 
-    // Verificar se débito não ultrapassa limite
-    if transacao.tipo == "d" && novo_saldo < -limite {
-        // Rollback automático quando tx sai de escopo
-        return Ok(HttpResponse::UnprocessableEntity().json("Saldo insuficiente"));
-    }
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return Ok(HttpResponse::ServiceUnavailable().finish()), // Or another appropriate error
+    };
 
-    // Atualizar saldo do cliente
-    if let Err(e) = tx
-        .execute(
-            "UPDATE clientes SET saldo = $1 WHERE id = $2",
-            &[&novo_saldo, &cliente_id],
-        )
+    let sql = "
+        UPDATE clientes
+        SET saldo = saldo + $1
+        WHERE id = $2 AND saldo + $1 >= -limite
+        RETURNING limite, saldo as novo_saldo
+    ";
+    let result: Option<(i32, i32)> = match sqlx::query_as(sql)
+        .bind(valor_a_aplicar)
+        .bind(cliente_id)
+        .fetch_optional(&mut *tx)
         .await
     {
-        error!("Erro ao atualizar saldo cliente {}: {:?}", cliente_id, e);
-        return Ok(HttpResponse::InternalServerError().json("Erro ao atualizar saldo"));
-    }
+        Ok(res) => res,
+        Err(e) => {
+            error!(
+                "DB error during update-check for client {}: {:?}",
+                cliente_id, e
+            );
+            return Ok(HttpResponse::InternalServerError().finish());
+        }
+    };
 
-    // Inserir transação
-    let now = chrono::Utc::now();
-    if let Err(e) = tx
-        .execute(
-            "INSERT INTO transacoes (cliente_id, valor, tipo, descricao, realizada_em) VALUES ($1, $2, $3, $4, $5)",
-            &[&cliente_id, &transacao.valor, &transacao.tipo, &transacao.descricao, &now],
-        )
-        .await
+    let (limite, novo_saldo) = match result {
+        Some((limite, novo_saldo)) => (limite, novo_saldo),
+        None => {
+            return Ok(HttpResponse::UnprocessableEntity().finish());
+        }
+    };
+
+    let now = Utc::now();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO transacoes (cliente_id, valor, tipo, descricao, realizada_em) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(cliente_id)
+    .bind(transacao.valor)
+    .bind(&transacao.tipo)
+    .bind(&transacao.descricao)
+    .bind(now.to_rfc3339())
+    .execute(&mut *tx)
+    .await
     {
-        error!("Erro ao inserir transação cliente {}: {:?}", cliente_id, e);
-        return Ok(HttpResponse::InternalServerError().json("Erro ao inserir transação"));
+        error!("DB error inserting transaction for client {}: {:?}", cliente_id, e);
+        return Ok(HttpResponse::InternalServerError().finish());
     }
 
-    // Commit da transação
     if let Err(e) = tx.commit().await {
         error!(
-            "Erro ao confirmar transação cliente {}: {:?}",
+            "DB error committing transaction for client {}: {:?}",
             cliente_id, e
         );
-        return Ok(HttpResponse::InternalServerError().json("Erro ao confirmar transação"));
+        return Ok(HttpResponse::InternalServerError().finish());
     }
 
     let response = TransacaoResponse {
@@ -165,32 +131,27 @@ async fn criar_transacao(
     Ok(HttpResponse::Ok().json(response))
 }
 
-async fn obter_extrato(path: web::Path<i32>, pool: web::Data<Pool>) -> ActixResult<HttpResponse> {
+async fn obter_extrato(
+    path: web::Path<i32>,
+    pool: web::Data<Pool<Sqlite>>,
+) -> ActixResult<HttpResponse> {
     let cliente_id = path.into_inner();
 
-    let client = match pool.get().await {
-        Ok(client) => client,
-        Err(e) => {
-            error!(
-                "Erro ao obter conexão do pool para extrato cliente {}: {:?}",
-                cliente_id, e
-            );
-            return Ok(HttpResponse::InternalServerError().json("Erro de conexão"));
-        }
-    };
+    // Validar se cliente_id está na faixa válida (1-5)
+    if cliente_id < 1 || cliente_id > 5 {
+        return Ok(HttpResponse::NotFound().json("Cliente não encontrado"));
+    }
 
     // Verificar se cliente existe e buscar dados atuais
-    let row = match client
-        .query_one(
-            "SELECT id, limite, saldo FROM clientes WHERE id = $1",
-            &[&cliente_id],
-        )
+    let row = match sqlx::query("SELECT id, limite, saldo FROM clientes WHERE id = ?")
+        .bind(cliente_id)
+        .fetch_one(pool.get_ref())
         .await
     {
         Ok(row) => row,
         Err(e) => {
             error!(
-                "Erro ao buscar cliente {} para extrato: {:?}",
+                "ERROR Erro ao buscar cliente {} para extrato: {:?}",
                 cliente_id, e
             );
             return Ok(HttpResponse::NotFound().json("Cliente não encontrado"));
@@ -201,17 +162,20 @@ async fn obter_extrato(path: web::Path<i32>, pool: web::Data<Pool>) -> ActixResu
     let saldo_atual: i32 = row.get("saldo");
 
     // Buscar últimas 10 transações
-    let rows = match client
-        .query(
-            "SELECT valor, tipo, descricao, realizada_em FROM transacoes
-             WHERE cliente_id = $1 ORDER BY realizada_em DESC LIMIT 10",
-            &[&cliente_id],
-        )
-        .await
+    let rows = match sqlx::query(
+        "SELECT valor, tipo, descricao, realizada_em FROM transacoes
+         WHERE cliente_id = ? ORDER BY realizada_em DESC LIMIT 10",
+    )
+    .bind(cliente_id)
+    .fetch_all(pool.get_ref())
+    .await
     {
         Ok(rows) => rows,
         Err(e) => {
-            error!("Erro ao buscar transações cliente {}: {:?}", cliente_id, e);
+            error!(
+                "ERROR Erro ao buscar transações cliente {}: {:?}",
+                cliente_id, e
+            );
             return Ok(HttpResponse::InternalServerError().json("Erro ao buscar transações"));
         }
     };
@@ -219,7 +183,11 @@ async fn obter_extrato(path: web::Path<i32>, pool: web::Data<Pool>) -> ActixResu
     let ultimas_transacoes: Vec<TransacaoInfo> = rows
         .iter()
         .map(|row| {
-            let realizada_em: DateTime<Utc> = row.get("realizada_em");
+            let realizada_em_str: String = row.get("realizada_em");
+            let realizada_em = DateTime::parse_from_rfc3339(&realizada_em_str)
+                .unwrap_or_else(|_| Utc::now().into())
+                .with_timezone(&Utc);
+
             TransacaoInfo {
                 valor: row.get("valor"),
                 tipo: row.get("tipo"),
@@ -241,15 +209,7 @@ async fn obter_extrato(path: web::Path<i32>, pool: web::Data<Pool>) -> ActixResu
     Ok(HttpResponse::Ok().json(response))
 }
 
-async fn reset_client_balances(pool: web::Data<Pool>) -> ActixResult<HttpResponse> {
-    let client = match pool.get().await {
-        Ok(client) => client,
-        Err(e) => {
-            error!("Erro ao obter conexão do pool: {:?}", e);
-            return Ok(HttpResponse::InternalServerError().json("Erro de conexão"));
-        }
-    };
-
+async fn reset_client_balances(pool: web::Data<Pool<Sqlite>>) -> ActixResult<HttpResponse> {
     // Setar o saldo dos clientes para como deveriam ser inicialmente
     let reset_query = "
         UPDATE clientes
@@ -268,8 +228,8 @@ async fn reset_client_balances(pool: web::Data<Pool>) -> ActixResult<HttpRespons
             WHEN 5 THEN 500000
         END
         WHERE id IN (1, 2, 3, 4, 5)";
-    if let Err(e) = client.execute(reset_query, &[]).await {
-        error!("Erro ao resetar saldos dos clientes: {:?}", e);
+    if let Err(e) = sqlx::query(reset_query).execute(pool.get_ref()).await {
+        error!("ERROR Erro ao resetar saldos dos clientes: {:?}", e);
         return Ok(HttpResponse::InternalServerError().json("Erro ao resetar saldos"));
     }
 
@@ -282,30 +242,64 @@ async fn health_check() -> ActixResult<HttpResponse> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init();
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://admin:123@db:5432/rinha".to_string());
+    let database_url =
+        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:///shared/rinha.db".to_string());
 
-    let mut cfg = Config::new();
-    cfg.url = Some(database_url);
+    // Extrair o caminho do arquivo SQLite e garantir que o diretório existe
+    let db_path = database_url
+        .strip_prefix("sqlite://")
+        .unwrap_or(&database_url);
+    if let Some(parent_dir) = std::path::Path::new(db_path).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent_dir) {
+            error!("ERROR Erro ao criar diretório do banco: {:?}", e);
+            std::process::exit(1);
+        }
+        println!("Diretório do banco assegurado: {:?}", parent_dir);
+    }
 
-    // Configurar pool para alta concorrência
-    cfg.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: 20, // Máximo de 20 conexões no pool
-        ..Default::default()
-    });
-
-    let pool = match cfg.create_pool(Some(Runtime::Tokio1), NoTls) {
+    // Configurar SQLite pool com WAL mode e otimizações para concorrência
+    let pool = match sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(14)
+        .min_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .idle_timeout(std::time::Duration::from_secs(600))
+        .max_lifetime(std::time::Duration::from_secs(1800))
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+                .busy_timeout(std::time::Duration::from_millis(5000)) // 5 seconds timeout for locks
+                .pragma("cache_size", "1000000")
+                .pragma("foreign_keys", "true")
+                .pragma("temp_store", "memory")
+                .pragma("wal_autocheckpoint", "1000") // Checkpoint WAL after 1000 pages
+                .pragma("journal_size_limit", "67108864") // 64MB WAL limit
+                .pragma("mmap_size", "268435456"), // 256MB memory-mapped I/O
+        )
+        .await
+    {
         Ok(pool) => pool,
         Err(e) => {
-            error!("Falha ao criar pool de conexões: {:?}", e);
+            error!("ERROR Falha ao conectar ao SQLite: {:?}", e);
             std::process::exit(1);
         }
     };
 
+    // Executar schema
+    if let Err(e) = sqlx::query(include_str!("../script.sql"))
+        .execute(&pool)
+        .await
+    {
+        error!("Erro ao executar schema: {:?}", e);
+        std::process::exit(1);
+    }
+
     println!("Servidor iniciando na porta 8080...");
-    println!("Pool de conexões configurado com max_size: 20");
+    println!("SQLite configurado com WAL mode para alta performance");
 
     HttpServer::new(move || {
         App::new()
@@ -317,7 +311,7 @@ async fn main() -> std::io::Result<()> {
             .route("/reset", web::post().to(reset_client_balances))
     })
     .bind("0.0.0.0:8080")?
-    .workers(4)
+    .workers(14)
     .run()
     .await
 }

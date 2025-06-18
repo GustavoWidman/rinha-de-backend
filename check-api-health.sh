@@ -109,4 +109,3 @@ fi
 
 echo ""
 echo "🎉 API is ready for load testing!"
-echo "   Run: ./executar-teste-local.sh"
